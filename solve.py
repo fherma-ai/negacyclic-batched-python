@@ -11,7 +11,17 @@ so all of it is built in `init`, which is not timed. `run` sees the operands
 for the first time and does the arithmetic, including reading the limbs and
 writing them back, which is where a GPU answer would pay for its transfers.
 """
-from fherma import Inputs, Outputs, Point, Tensor, pack, unpack, unpack_one
+import array
+import os
+from multiprocessing import Pool
+
+from fherma import Inputs, Outputs, Point, Tensor, encode, unpack_one
+
+#: The `array` code for a `u32`, in the width this platform agrees on.
+CODE = "I" if array.array("I").itemsize == 4 else "L"
+
+#: What a worker is told once, rather than with every pair it is handed.
+_WORK = None
 
 
 def init(p: Point):
@@ -28,7 +38,7 @@ def init(p: Point):
         pw[i] = pw[i - 1] * psi % q
         iw[i] = iw[i - 1] * psi_inv % q
 
-    return {
+    ring = {
         "q": q,
         "n": n,
         "limbs": p.L,
@@ -40,27 +50,70 @@ def init(p: Point):
         "inverse": _twiddles(n, q, pow(omega, q - 2, q)),
     }
 
+    # The products are independent, so they are worked out one to a core. The
+    # pool is made here because `init` is not timed and because a worker builds
+    # the ring once rather than once a pair — the tables are sixty megabytes of
+    # integers and pickling them with every task would cost more than the
+    # arithmetic. The answers are reassembled in index order, so the result
+    # does not depend on how many cores the machine had.
+    workers = min(p.B, os.cpu_count() or 1)
+    ring["pool"] = Pool(workers, _enter, (ring,)) if workers > 1 else None
+    if ring["pool"] is None:
+        _enter(ring)
+    return ring
+
+
+def _enter(ring: dict) -> None:
+    """A worker's one-time setup: the ring it will answer pairs in."""
+    global _WORK
+    _WORK = ring
+
+
+def _answer(task):
+    """One pair, bytes in and bytes out, with its place in the batch."""
+    index, raw_a, raw_b = task
+    ring = _WORK
+    n, limbs = ring["n"], ring["limbs"]
+    size = limbs * 4
+    a = [int.from_bytes(raw_a[i * size : (i + 1) * size], "little") for i in range(n)]
+    b = [int.from_bytes(raw_b[i * size : (i + 1) * size], "little") for i in range(n)]
+    c = _product(a, b, ring)
+    return index, b"".join(value.to_bytes(size, "little") for value in c)
+
 
 def run(state, inp: Inputs) -> Outputs:
-    """Through `unpack` and `pack` and nothing else.
+    """One pair to a core, through the wire form the harness documents.
 
-    They are what the harness offers for a tensor whose last dimension is the
-    limbs, and they are what every version of it offers. Reaching past them
-    into `Tensor.data` is how this failed the first time: one release holds
-    that buffer as an array and another as a list of integers, and a solution
-    written against either is a solution that runs on one of them.
+    `encode` and the shape are what every release of the harness offers for a
+    tensor. Reaching past them into `Tensor.data` is how this failed the first
+    time: one release holds that buffer as an array and another as a list of
+    integers, and a solution written against either runs on one of them.
+
+    Reading the operands and writing the answer are inside the measured call
+    because the specification says they are — a GPU answer pays for its
+    transfers here too.
     """
     n, limbs, batch = state["n"], state["limbs"], state["batch"]
-    a, b = unpack(inp.a), unpack(inp.b)
+    size = n * limbs * 4
+    a, b = memoryview(encode(inp.a)), memoryview(encode(inp.b))
 
-    out = []
-    for j in range(batch):
-        lo, hi = j * n, (j + 1) * n
-        out.extend(_product(a[lo:hi], b[lo:hi], state))
+    def tasks():
+        # A generator, so only the pairs in flight are held as bytes.
+        for j in range(batch):
+            at = slice(j * size, (j + 1) * size)
+            yield j, bytes(a[at]), bytes(b[at])
 
-    # pack gives tensor<B*N x L>; the shape the signature asks for is the same
-    # words with the batch dimension spelled out.
-    return Outputs(c=Tensor((batch, n, limbs), pack(out, limbs, "u32").data, "u32"))
+    pool = state["pool"]
+    answers = (
+        list(pool.imap_unordered(_answer, tasks(), chunksize=1))
+        if pool
+        else [_answer(one) for one in tasks()]
+    )
+
+    words = array.array(CODE)
+    for _, raw in sorted(answers):
+        words.frombytes(raw)
+    return Outputs(c=Tensor((batch, n, limbs), words, "u32"))
 
 
 def _product(a, b, ring) -> list:
@@ -126,4 +179,7 @@ def _ntt(a: list, q: int, tables: list) -> list:
 
 
 def free(state) -> None:
-    return None
+    pool = state.get("pool") if isinstance(state, dict) else None
+    if pool:
+        pool.close()
+        pool.join()
