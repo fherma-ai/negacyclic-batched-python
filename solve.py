@@ -11,7 +11,7 @@ so all of it is built in `init`, which is not timed. `run` sees the operands
 for the first time and does the arithmetic, including reading the limbs and
 writing them back, which is where a GPU answer would pay for its transfers.
 """
-from fherma import Inputs, Outputs, Point, Tensor, encode, unpack_one
+from fherma import Inputs, Outputs, Point, Tensor, pack, unpack, unpack_one
 
 
 def init(p: Point):
@@ -42,19 +42,25 @@ def init(p: Point):
 
 
 def run(state, inp: Inputs) -> Outputs:
-    q, n, limbs, batch = state["q"], state["n"], state["limbs"], state["batch"]
-    size = limbs * 4
-    a, b = memoryview(encode(inp.a)), memoryview(encode(inp.b))
+    """Through `unpack` and `pack` and nothing else.
+
+    They are what the harness offers for a tensor whose last dimension is the
+    limbs, and they are what every version of it offers. Reaching past them
+    into `Tensor.data` is how this failed the first time: one release holds
+    that buffer as an array and another as a list of integers, and a solution
+    written against either is a solution that runs on one of them.
+    """
+    n, limbs, batch = state["n"], state["limbs"], state["batch"]
+    a, b = unpack(inp.a), unpack(inp.b)
 
     out = []
     for j in range(batch):
-        at = j * n * size
-        x = [int.from_bytes(a[at + i * size : at + (i + 1) * size], "little") for i in range(n)]
-        y = [int.from_bytes(b[at + i * size : at + (i + 1) * size], "little") for i in range(n)]
-        out.extend(_product(x, y, state))
+        lo, hi = j * n, (j + 1) * n
+        out.extend(_product(a[lo:hi], b[lo:hi], state))
 
-    raw = b"".join(value.to_bytes(size, "little") for value in out)
-    return Outputs(c=Tensor((batch, n, limbs), raw, "u32"))
+    # pack gives tensor<B*N x L>; the shape the signature asks for is the same
+    # words with the batch dimension spelled out.
+    return Outputs(c=Tensor((batch, n, limbs), pack(out, limbs, "u32").data, "u32"))
 
 
 def _product(a, b, ring) -> list:
