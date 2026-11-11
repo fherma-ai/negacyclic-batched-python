@@ -1,0 +1,17 @@
+kind = "solution"
+spec = "polymul/negacyclic-batched@1.0.0"
+
+# Where your three functions are. The platform does not need to be told how to
+# start the process: it generated the loop that starts it, and the command is a
+# property of the language rather than something to declare.
+[entry]
+init = "solve:init"
+run  = "solve:run"
+free = "solve:free"
+
+[runtime]
+language = "python"
+
+# How it starts, given the directory of one point. Generated, and here so it
+# can be read rather than guessed at.
+run = "python main.py"
